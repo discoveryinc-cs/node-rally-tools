@@ -463,6 +463,11 @@
         }
       }
 
+      if (exports.configObject.dryRun && method !== "GET") {
+        log(chalk$1`{red Skipping ${method} request for dry run}`);
+        return null;
+      }
+
       let requestOptions = {
         method,
         body,
@@ -942,7 +947,7 @@
 
     async fullResults() {
       await this.initializeFirstRequest();
-      let maxParallelRequests = this.opts.maxParallelRequests || this.opts.chunksize || 20;
+      let maxParallelRequests = this.opts.maxParallelRequests || this.opts.chunksize || 5;
       let currentPromises = []; //generate the first set of requests. Everything after this will re-use these i promiseIDs
 
       for (let i = 0; i < maxParallelRequests; i++) {
@@ -1102,6 +1107,74 @@
   defineAssoc(Notification, "remote", "meta.remote");
   Notification.endpoint = "notificationPresets";
 
+  class Tag extends RallyBase {
+    constructor({
+      data,
+      remote
+    } = {}) {
+      super();
+      this.meta = {};
+      this.remote = remote;
+      this.data = data; //this.data.attributes.rallyConfiguration = undefined;
+      //this.data.attributes.systemManaged = undefined;
+    }
+
+    chalkPrint(pad = true) {
+      let id = String("T-" + this.remote + "-" + this.id);
+      if (pad) id = id.padStart(10);
+      let prefix = this.curated ? "blue +" : "red -";
+      return chalk`{green ${id}}: {${prefix}${this.name}}`;
+    }
+
+    static async create(env, name, {
+      notCurated
+    } = {}) {
+      return new Tag({
+        data: await lib.makeAPIRequest({
+          env,
+          path: `/${this.endpoint}`,
+          method: "POST",
+          payload: {
+            data: {
+              attributes: {
+                name,
+                curated: notCurated ? false : true
+              },
+              type: "tagNames"
+            }
+          }
+        }),
+        remote: env
+      });
+    }
+
+    async curate() {
+      this.curated = !this.curated;
+      return await lib.makeAPIRequest({
+        env: this.remote,
+        path: `/tagNames/${this.id}`,
+        method: "PATCH",
+        payload: {
+          data: {
+            attributes: {
+              curated: this.curated
+            },
+            type: "tagNames"
+          }
+        }
+      });
+    }
+
+  }
+
+  defineAssoc(Tag, "id", "data.id");
+  defineAssoc(Tag, "attributes", "data.attributes");
+  defineAssoc(Tag, "relationships", "data.relationships");
+  defineAssoc(Tag, "name", "data.attributes.name");
+  defineAssoc(Tag, "curated", "data.attributes.curated");
+  defineAssoc(Tag, "remote", "meta.remote");
+  Tag.endpoint = "tagNames";
+
   let home;
 
   if (os.homedir) {
@@ -1212,6 +1285,14 @@
       let pNext = await this.resolveField(Rule, "passNext", false, "specific");
       let eNext = await this.resolveField(Rule, "errorNext", false, "specific");
       let proType = await this.resolveField(Provider, "providerType", false, "specific");
+      let proTag = await this.resolveField(Tag, "providerFilterTag", false, "specific");
+
+      if (proTag) {
+        this.data.attributes.providerFilter = proTag.id;
+      } else {
+        this.data.attributes.providerFilter = null;
+      }
+
       let dynamicNexts = await this.resolveField(Rule, "dynamicNexts", true, "specific");
       let enterNotif = await this.resolveField(Notification, "enterNotifications", true, "specific");
       let errorNotif = await this.resolveField(Notification, "errorNotifications", true, "specific");
@@ -1220,7 +1301,7 @@
 
     async saveA(env) {
       if (lib.isLocalEnv(env)) return;
-      return await this.createIfNotExist(env);
+      return await this.createOrUpdate(env);
     }
 
     async saveB(env) {
@@ -1234,8 +1315,7 @@
         log(chalk`Saving rule {green ${this.name}} to {blue ${lib.envName(env)}}.`);
         writeFileSync(this.localpath, JSON.stringify(orderedObjectKeys(this.data), null, 4));
       } else {
-        await this.acclimatize(env);
-        return await this.uploadRemote(env);
+        return await this.createOrUpdate(env);
       }
     }
 
@@ -1243,8 +1323,9 @@
       return false;
     }
 
-    async createIfNotExist(env) {
+    async createOrUpdate(env) {
       write(chalk`First pass rule {green ${this.name}} to {green ${env}}: `);
+      await this.acclimatize(env);
 
       if (this.immutable) {
         log(chalk`{magenta IMMUTABLE}. Nothing to do.`);
@@ -1254,30 +1335,41 @@
 
       let remote = await Rule.getByName(env, this.name);
       this.idMap = this.idMap || {};
+      this.relationships.transitions = {
+        data: await this.constructWorkflowTransitions()
+      };
 
       if (remote) {
         this.idMap[env] = remote.id;
         log(chalk`exists ${remote.chalkPrint(false)}`);
-        return;
-      } //If it exists we can replace it
 
-
-      write("create, ");
-      let res = await lib.makeAPIRequest({
-        env,
-        path: `/workflowRules`,
-        method: "POST",
-        payload: {
-          data: {
-            attributes: {
-              name: this.name
-            },
-            type: "workflowRules"
-          }
+        if (exports.configObject.skipStarred) {
+          write("no starred, ");
+          this.data.attributes.starred = undefined;
         }
-      });
-      this.idMap = this.idMap || {};
-      this.idMap[env] = res.data.id;
+
+        write("replace, ");
+        let res = await lib.makeAPIRequest({
+          env,
+          path: `/workflowRules/${this.idMap[env]}`,
+          method: "PUT",
+          payload: {
+            data: this.data
+          }
+        });
+      } else {
+        write("create, ");
+        let res = await lib.makeAPIRequest({
+          env,
+          path: `/workflowRules`,
+          method: "POST",
+          payload: {
+            data: this.data
+          }
+        });
+        this.idMap[env] = res.data.id;
+      }
+
       write("id ");
       log(this.idMap[env]);
     }
@@ -1312,40 +1404,24 @@
       //}
     }
 
-    async uploadRemote(env) {
-      write(chalk`Uploading rule {green ${this.name}} to {green ${env}}: `);
+    async deleteRemoteVersion(env, id = null) {
+      if (lib.isLocalEnv(env)) return false;
 
-      if (this.immutable) {
-        log(chalk`{magenta IMMUTABLE}. Nothing to do.`);
-        return;
+      if (!id) {
+        let remote = await Rule.getByName(env, this.name);
+        id = remote.id;
       }
 
-      if (this.idMap[env]) {
-        this.remote = env;
-        await this.patchStrip();
-        this.data.id = this.idMap[env];
-        this.relationships.transitions = {
-          data: await this.constructWorkflowTransitions()
-        }; //If it exists we can replace it
+      return await lib.makeAPIRequest({
+        env,
+        path: `/workflowRules/${id}`,
+        method: "DELETE"
+      });
+    }
 
-        write("replace, ");
-        let res = await lib.makeAPIRequest({
-          env,
-          path: `/workflowRules/${this.idMap[env]}`,
-          method: "PUT",
-          payload: {
-            data: this.data
-          },
-          fullResponse: true
-        });
-        log(chalk`response {yellow ${res.statusCode}}`);
-
-        if (res.statusCode > 210) {
-          return `Failed to upload: ${res.body}`;
-        }
-      } else {
-        throw Error("Bad idmap!");
-      }
+    async delete() {
+      if (lib.isLocalEnv(this.remote)) return false;
+      return await this.deleteRemoteVersion(this.remote, this.id);
     }
 
     get localpath() {
@@ -1357,7 +1433,13 @@
 
       let pNext = await this.resolveField(Rule, "passNext", false);
       let eNext = await this.resolveField(Rule, "errorNext", false);
-      let proType = await this.resolveField(Provider, "providerType", false); //log("Dynamic nexts")
+      let proType = await this.resolveField(Provider, "providerType", false);
+      let proTag = await this.resolveField(Tag, "providerFilterTag", false);
+
+      if (proTag && this.data.attributes.providerFilter) {
+        delete this.data.attributes.providerFilter;
+      } //log("Dynamic nexts")
+
 
       let dynamicNexts = await this.resolveField(Rule, "dynamicNexts", true); //log(dynamicNexts);
 
@@ -1371,6 +1453,7 @@
       return {
         preset,
         proType,
+        proTag,
         pNext,
         eNext,
         dynamicNexts,
@@ -1583,7 +1666,7 @@
       return this.sizeGB <= .2;
     }
 
-    async getContent(force = false, noRedirect = false) {
+    async getContent(force = false, noRedirect = false, timeout = undefined) {
       if (!this.canBeDownloaded() && !force && !noRedirect) {
         throw new FileTooLargeError(this);
       }
@@ -1592,7 +1675,8 @@
         env: this.remote,
         fullPath: this.contentLink,
         qs: {
-          "no-redirect": noRedirect
+          "no-redirect": noRedirect,
+          timeout: timeout
         }
       });
 
@@ -1952,7 +2036,7 @@ ${eLine.line}`);
       })));
     }
 
-    async addFile(label, fileuris) {
+    async addFile(label, fileuris, generateMd5 = false, autoAnalyze = true) {
       if (!Array.isArray(fileuris)) fileuris = [fileuris];
       let instances = {};
 
@@ -1970,7 +2054,9 @@ ${eLine.line}`);
           "data": {
             "attributes": {
               label,
-              instances
+              instances,
+              generateMd5,
+              autoAnalyze
             },
             "relationships": {
               "asset": {
@@ -2906,7 +2992,9 @@ ${eLine.line}`);
     }
 
     async uploadPresetData(env, id) {
-      if (this.code.trim() === "NOUPLOAD") {
+      var _this$code;
+
+      if (((_this$code = this.code) === null || _this$code === void 0 ? void 0 : _this$code.trim()) === "NOUPLOAD") {
         write(chalk`code skipped {yellow :)}, `); // Not an error, so return null
 
         return null;
@@ -3778,74 +3866,6 @@ ${eLine.line}`);
   defineAssoc(User, "email", "data.attributes.email");
   defineAssoc(User, "remote", "meta.remote");
   User.endpoint = "users";
-
-  class Tag extends RallyBase {
-    constructor({
-      data,
-      remote
-    } = {}) {
-      super();
-      this.meta = {};
-      this.remote = remote;
-      this.data = data; //this.data.attributes.rallyConfiguration = undefined;
-      //this.data.attributes.systemManaged = undefined;
-    }
-
-    chalkPrint(pad = true) {
-      let id = String("T-" + this.remote + "-" + this.id);
-      if (pad) id = id.padStart(10);
-      let prefix = this.curated ? "blue +" : "red -";
-      return chalk`{green ${id}}: {${prefix}${this.name}}`;
-    }
-
-    static async create(env, name, {
-      notCurated
-    } = {}) {
-      return new Tag({
-        data: await lib.makeAPIRequest({
-          env,
-          path: `/${this.endpoint}`,
-          method: "POST",
-          payload: {
-            data: {
-              attributes: {
-                name,
-                curated: notCurated ? false : true
-              },
-              type: "tagNames"
-            }
-          }
-        }),
-        remote: env
-      });
-    }
-
-    async curate() {
-      this.curated = !this.curated;
-      return await lib.makeAPIRequest({
-        env: this.remote,
-        path: `/tagNames/${this.id}`,
-        method: "PATCH",
-        payload: {
-          data: {
-            attributes: {
-              curated: this.curated
-            },
-            type: "tagNames"
-          }
-        }
-      });
-    }
-
-  }
-
-  defineAssoc(Tag, "id", "data.id");
-  defineAssoc(Tag, "attributes", "data.attributes");
-  defineAssoc(Tag, "relationships", "data.relationships");
-  defineAssoc(Tag, "name", "data.attributes.name");
-  defineAssoc(Tag, "curated", "data.attributes.curated");
-  defineAssoc(Tag, "remote", "meta.remote");
-  Tag.endpoint = "tagNames";
 
   let stagingEmsg = chalk`Not currently on a clean staging branch. Please move to staging or resolve the commits.
 Try {red git status} or {red rally stage edit --verbose} for more info.`;
@@ -17802,6 +17822,12 @@ nothing to commit, working tree clean`;
     async uploadPresets(env, presets, createFunc = () => false) {
       for (let preset of presets) {
         await preset.uploadCodeToEnv(env, createFunc);
+      }
+    },
+
+    async uploadRules(env, rules) {
+      for (let rule of rules) {
+        await rule.createOrUpdate(env);
       }
     },
 

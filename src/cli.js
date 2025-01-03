@@ -281,6 +281,8 @@ let rulesub = {
     async before(args){
         this.env = args.env;
         if(!this.env) throw new AbortError("No env supplied");
+
+        this.files = await getFilesFromArgs(args);
     },
     async $list(args){
         elog("Loading...");
@@ -297,7 +299,7 @@ let rulesub = {
         let preset = await configHelpers.selectPreset({canSelectNone: false});
         let passNext = await configHelpers.selectRule({purpose: "'On Exit OK'"});
         let errorNext = await configHelpers.selectRule({purpose: "'On Exit Error'"});
-        let name = await configHelpers.askInput("Rule Name", "What is the rule name?");
+        let name = await configHelpers.askInput("Rule Name", "What is the rule name? ('@' to insert full preset name)");
         name = name.replace("@", preset.name);
         let desc = await configHelpers.askInput("Description", "Enter a description.");
 
@@ -327,6 +329,36 @@ let rulesub = {
         }
 
         rule.saveB()
+    },
+    async $upload(args){
+        if(!this.files){
+            throw new AbortError("No files provided to upload (use --file argument)");
+        }
+
+        log(chalk`Uploading {green ${this.files.length}} rule(s) to {green ${this.env}}.`);
+
+        let rules = this.files.map(path => new Rule({path, remote: false}));
+        await funcs.uploadRules(this.env, rules);
+    },
+    async $deleteRemote(args){
+        let file = this.files[0];
+        if(!this.files){
+            throw new AbortError("No files provided to delete (use --file argument)");
+        }
+
+        let rule = new Rule({path: file, remote: false});
+        if(!rule.name){
+            throw new AbortError(chalk`No rule header found. Cannot get name.`);
+        }
+
+        let rule2 = await Rule.getByName(this.env, rule.name);
+        if(!rule2){
+            throw new AbortError(chalk`No rule found with name {red ${rule.name}} on {blue ${this.env}}`);
+        }
+
+        log(chalk`Deleting ${rule2.chalkPrint(true)}.`);
+
+        log(await rule2.delete());
     },
     async unknown(arg, args){
         log(chalk`Unknown action {red ${arg}} try '{white rally help rule}'`);
@@ -876,6 +908,8 @@ let cli = {
     @arg(`~`,  `--init-data`,  chalk`Init data to use when launching job. can be string, or {white @path/to/file} for a file`)
     @arg(`~`,  `--file-label`, chalk`File label (used with addfile)`)
     @arg(`~`,  `--file-uri`,   chalk`File s3 uri. Can use multiple uri's for the same label (used with addfile)`)
+    @arg(`~`,  `--auto-analyze`, chalk`autoAnalyze? (default: true) (used with addfile)`)
+    @arg(`~`,  `--generate-md5`,   chalk`Generate md5 hash? (default: false) (used with addfile)`)
     @arg(`~`,  `--metadata`,   chalk`Metadata to use with patchMetadata. Can be string, or {white @path/to/file} for a file. Data must contain a top level key Metadata, or Workflow. Metadata will be pached into METADATA. Workflow will be patched into WORKFLOW_METADATA(not currently available)`)
     @arg(`~`,  `--priority`,   chalk`set the priority of all launched jobs`)
     @arg(`~`,  `--new-name`,   chalk`set the new name`)
@@ -988,7 +1022,16 @@ let cli = {
                 if(label === undefined || !uri){
                     throw new AbortError("Number of file-label and file-uri does not match");
                 }
-                await asset.addFile(label, uri);
+
+                let genMd5 = args["generate-md5"];
+                if(genMd5 === undefined) {
+                    genMd5 = false;
+                }
+                let autoA = args["auto-analyze"];
+                if(autoA === undefined) {
+                    autoA = true;
+                }
+                await asset.addFile(label, uri, genMd5, autoA);
                 log(chalk`Added file ${label}`);
                 fileArg++;
             }else if(arg === "delete"){
@@ -1032,7 +1075,12 @@ let cli = {
                 fileArg++;
 
                 let file = await asset.getFileByLabel(label);
-                log(await file.getContent(false, true));
+                let timeout = undefined;
+                if(args.timeout) {
+                    timeout = args.timeout;
+                }
+                log(await file.getContent(false, true, timeout));
+
             }else if(arg === "deletefile" || arg === "deleteFile" || arg === "removefile" || arg === "removeFile") {
                 let label = arrayify(args["file-label"], fileArg)
                 if(!label){
@@ -1542,6 +1590,10 @@ async function $main(){
         configObject.storeStage = true;
     }
 
+    if(argv["dry-run"]){
+        configObject.dryRun = true;
+    }
+
     if(argv["script"]){
         configObject.script = true;
     }
@@ -1561,6 +1613,12 @@ async function $main(){
     if(argv["no-replacer"]){
         configObject.noReplacer = true;
     }
+
+    if(argv["skip-starred"]){
+        log("NO STARRED");
+        configObject.skipStarred = true;
+    }
+    log("A");
 
     configObject.globalProgress = argv["show-progress"] || false;
 

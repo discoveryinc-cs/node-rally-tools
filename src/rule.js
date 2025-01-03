@@ -4,6 +4,7 @@ import {configObject} from "./config.js";
 import Preset from "./preset.js";
 import Provider from "./providers.js";
 import Notification from "./notification.js";
+import Tag from "./tag.js";
 
 import {writeFileSync, readFileSync} from "./fswrap.js";
 import {join, resolve as pathResolve} from "path";
@@ -62,6 +63,12 @@ class Rule extends RallyBase{
         let pNext   = await this.resolveField(Rule, "passNext", false, "specific");
         let eNext   = await this.resolveField(Rule, "errorNext", false, "specific");
         let proType = await this.resolveField(Provider, "providerType", false, "specific");
+        let proTag  = await this.resolveField(Tag, "providerFilterTag", false, "specific");
+        if(proTag){
+            this.data.attributes.providerFilter = proTag.id;
+        }else{
+            this.data.attributes.providerFilter = null;
+        }
 
         let dynamicNexts = await this.resolveField(Rule, "dynamicNexts", true, "specific");
 
@@ -71,7 +78,7 @@ class Rule extends RallyBase{
     }
     async saveA(env){
         if(lib.isLocalEnv(env)) return;
-        return await this.createIfNotExist(env);
+        return await this.createOrUpdate(env);
     }
     async saveB(env){
         if(!this.isGeneric){
@@ -83,15 +90,16 @@ class Rule extends RallyBase{
 
             writeFileSync(this.localpath, JSON.stringify(orderedObjectKeys(this.data), null, 4));
         }else{
-            await this.acclimatize(env);
-            return await this.uploadRemote(env);
+            return await this.createOrUpdate(env);
         }
     }
     get immutable(){
         return false;
     }
-    async createIfNotExist(env){
+    async createOrUpdate(env){
         write(chalk`First pass rule {green ${this.name}} to {green ${env}}: `);
+
+        await this.acclimatize(env);
 
         if(this.immutable){
             log(chalk`{magenta IMMUTABLE}. Nothing to do.`);
@@ -102,21 +110,34 @@ class Rule extends RallyBase{
         let remote = await Rule.getByName(env, this.name);
 
         this.idMap = this.idMap || {};
+        this.relationships.transitions = {
+            data: await this.constructWorkflowTransitions(),
+        };
 
         if(remote){
             this.idMap[env] = remote.id;
             log(chalk`exists ${remote.chalkPrint(false)}`);
-            return;
+
+            if (configObject.skipStarred) {
+                write("no starred, ");
+                this.data.attributes.starred = undefined;
+            }
+
+            write("replace, ");
+            let res = await lib.makeAPIRequest({
+                env, path: `/workflowRules/${this.idMap[env]}`, method: "PUT",
+                payload: {data: this.data},
+            });
+        } else {
+            write("create, ");
+            let res = await lib.makeAPIRequest({
+                env, path: `/workflowRules`, method: "POST",
+                payload: {data: this.data},
+            });
+
+            this.idMap[env] = res.data.id;
         }
 
-        //If it exists we can replace it
-        write("create, ");
-        let res = await lib.makeAPIRequest({
-            env, path: `/workflowRules`, method: "POST",
-            payload: {data: {attributes: {name: this.name}, type: "workflowRules"}},
-        });
-        this.idMap = this.idMap || {};
-        this.idMap[env] = res.data.id;
         write("id ");
         log(this.idMap[env]);
     }
@@ -153,38 +174,23 @@ class Rule extends RallyBase{
         //}
     }
 
-    async uploadRemote(env){
-        write(chalk`Uploading rule {green ${this.name}} to {green ${env}}: `);
-
-        if(this.immutable){
-            log(chalk`{magenta IMMUTABLE}. Nothing to do.`);
-            return;
+    async deleteRemoteVersion(env, id=null){
+        if(lib.isLocalEnv(env)) return false;
+        if(!id){
+            let remote = await Rule.getByName(env, this.name);
+            id = remote.id;
         }
 
-        if(this.idMap[env]){
-            this.remote = env;
+        return await lib.makeAPIRequest({
+            env, path: `/workflowRules/${id}`,
+            method: "DELETE",
+        });
+    }
 
-            await this.patchStrip();
-            this.data.id = this.idMap[env];
+    async delete(){
+        if(lib.isLocalEnv(this.remote)) return false;
 
-            this.relationships.transitions = {
-                data: await this.constructWorkflowTransitions(),
-            };
-
-            //If it exists we can replace it
-            write("replace, ");
-            let res = await lib.makeAPIRequest({
-                env, path: `/workflowRules/${this.idMap[env]}`, method: "PUT",
-                payload: {data: this.data}, fullResponse: true,
-            });
-
-            log(chalk`response {yellow ${res.statusCode}}`);
-            if(res.statusCode > 210){
-                return `Failed to upload: ${res.body}`;
-            }
-        }else{
-            throw Error("Bad idmap!");
-        }
+        return await this.deleteRemoteVersion(this.remote, this.id);
     }
 
     get localpath(){
@@ -197,6 +203,10 @@ class Rule extends RallyBase{
         let pNext   = await this.resolveField(Rule, "passNext", false);
         let eNext   = await this.resolveField(Rule, "errorNext", false);
         let proType = await this.resolveField(Provider, "providerType", false);
+        let proTag  = await this.resolveField(Tag, "providerFilterTag", false);
+        if(proTag && this.data.attributes.providerFilter) {
+            delete this.data.attributes.providerFilter
+        }
 
         //log("Dynamic nexts")
         let dynamicNexts = await this.resolveField(Rule, "dynamicNexts", true);
@@ -213,7 +223,7 @@ class Rule extends RallyBase{
         this.isGeneric = true;
 
         return {
-            preset, proType,
+            preset, proType, proTag,
             pNext, eNext,
             dynamicNexts,
             errorNotif, enterNotif, passNotif,
