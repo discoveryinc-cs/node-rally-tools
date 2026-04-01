@@ -1,0 +1,12 @@
+CODEOWNERS @discoveryinc-cs/msc-platform-engineering
+
+# Workflows
+.github/workflows/** @discoveryinc-cs/msc-platform-engineering
+
+# OMD Files
+.omd/** @discoveryinc-cs/msc-platform-engineering
+
+
+deploy/** @discoveryinc-cs/msc-platform-engineering
+gradle/** @discoveryinc-cs/msc-platform-engineering
+**/pipeline/** @discoveryinc-cs/msc-platform-engineering
